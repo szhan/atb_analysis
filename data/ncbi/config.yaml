@@ -1,0 +1,6 @@
+ncbi_datasets:
+  taxon: 1280
+  assembly-source: RefSeq
+
+mummer:
+  ref_file: TW20.fasta
