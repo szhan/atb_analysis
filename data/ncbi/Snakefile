@@ -1,0 +1,159 @@
+"""
+Data files downloaded from the NCBI are in ncbi_dataset/data/.
+* ncbi_dataset/data/<ACCESSION>/<ACCESSION>_<ASSEMBLY>_genomic.fna
+* ncbi_dataset/data/assembly_data_report.jsonl
+* ncbi_dataset/data/dataset_catalog.json
+
+There are additional files from the NCBI data package.
+* README.md
+* md5sum.txt
+
+Result files from MUMmer are in ncbi_dataset/mummer_results/.
+* ncbi_dataset/mummer_results/<ACCESSION>_<ASSEMBLY>.1coords
+* ncbi_dataset/mummer_results/<ACCESSION>_<ASSEMBLY>.1delta
+* ncbi_dataset/mummer_results/<ACCESSION>_<ASSEMBLY>.delta
+* ncbi_dataset/mummer_results/<ACCESSION>_<ASSEMBLY>.snps
+
+In addition to a snakemake log file, there is one to keep mummer stdout:
+* mummer.log
+
+When finished, MUMMER_DONE should be in the directory.
+"""
+
+configfile: "config.yaml"
+
+
+import glob
+from pathlib import Path
+
+
+NCBI_DATASET_ZIP = "ncbi_dataset.zip"
+NCBI_DATASET_DIR = Path("ncbi_dataset/data")
+
+MUMMER_DIR = "../../ext/MUMmer3.23"
+RESULTS_DIR = NCBI_DATASET_DIR / ".." / "mummer_results"
+
+REF_FILE = config["mummer"]["ref_file"]
+TAXON = config["ncbi_datasets"]["taxon"]
+NUMPY_FILE = "ncbi_mummer_" + str(TAXON) + ".npy"
+METADATA_FILE = "ncbi_metadata_" + str(TAXON) + ".tsv"
+
+
+rule all:
+    input:
+        NUMPY_FILE,
+        METADATA_FILE
+
+
+rule parse_metadata:
+    input:
+        NCBI_DATASET_DIR / "assembly_data_report.jsonl"
+    output:
+        METADATA_FILE
+    run:
+        import json
+        import pandas as pd
+        data = []
+        with open(input[0], "r") as f:
+            for line in f:
+                json_data = json.loads(line)
+                accession = json_data["accession"]
+                coldate = json_data["assemblyInfo"]["biosample"].get(
+                    "collectionDate", "not_available"
+                )
+                data.append({"accession": accession} | {"collection_date": coldate})
+        df = pd.DataFrame(data)
+        df.to_csv(output[0], sep="\t", index=False)
+
+
+rule import_alignments:
+    input:
+        RESULTS_DIR
+    output:
+        NUMPY_FILE
+    params:
+        ref_file = REF_FILE
+    shell:
+        "python -m bacts import-alignments {input} {params.ref_file} {output}"
+
+
+rule move_mummer_files:
+    input:
+        "MUMMER_DONE"
+    output:
+        RESULTS_DIR
+    shell:
+        """
+        mkdir {output}
+        mv {NCBI_DATASET_DIR}/*/*_genomic.fna.1coords {output}
+        mv {NCBI_DATASET_DIR}/*/*_genomic.fna.1delta {output}
+        mv {NCBI_DATASET_DIR}/*/*_genomic.fna.delta {output}
+        mv {NCBI_DATASET_DIR}/*/*_genomic.fna.snps {output}
+        """
+
+
+def get_file_paths(wildcards):
+    checkpoint_output = checkpoints.unzip_dataset.get().output[0]
+    return glob.glob(f"{checkpoint_output}/*/*_genomic.fna")
+
+
+rule run_mummer:
+    input:
+        unpack(get_file_paths)
+    output:
+        "MUMMER_DONE"
+    params:
+        ref_file = REF_FILE
+    run:
+        import subprocess
+        import os
+        all_output_files_exist = True
+        for fna_file in input:
+            delta_file = fna_file + "." + "delta"
+            delta1_file = fna_file + "." + "1delta"
+            coords1_file = fna_file + "." + "1coords"
+            snps_file = fna_file + "." + "snps"
+            if os.path.exists(coords1_file) and os.path.exists(snps_file):
+                continue
+            cmd = " && ".join([
+                f"{MUMMER_DIR}/nucmer --maxmatch {params.ref_file} {fna_file} -p {fna_file}",
+                f"{MUMMER_DIR}/delta-filter -1 {delta_file} > {delta1_file}",
+                f"{MUMMER_DIR}/show-coords -rclTH {delta1_file} > {coords1_file}",
+                f"{MUMMER_DIR}/show-snps -rlTHCI {delta1_file} > {snps_file}",
+            ])
+            process = subprocess.run(cmd, shell=True)
+            if not (os.path.exists(coords1_file) and os.path.exists(snps_file)):
+                all_output_files_exist = False
+                break
+        if all_output_files_exist:
+            subprocess.run(["touch", output[0]])
+        else:
+            raise RuntimeError("MUMmer failed for an accession.")
+
+
+checkpoint unzip_dataset:
+    input:
+        NCBI_DATASET_ZIP
+    output:
+        directory(NCBI_DATASET_DIR)
+    shell:
+        "unzip -q {input}"
+
+
+rule download_dataset:
+    output:
+        NCBI_DATASET_ZIP
+    params:
+        taxon = config["ncbi_datasets"]["taxon"],
+        assembly_source = config["ncbi_datasets"]["assembly-source"]
+    shell:
+        """
+        datasets download genome \
+            taxon {params.taxon} \
+            --filename {output} \
+            --include genome \
+            --assembly-source {params.assembly_source} \
+            --assembly-level complete \
+            --exclude-atypical \
+            --mag exclude
+        """
